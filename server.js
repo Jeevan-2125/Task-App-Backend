@@ -37,6 +37,7 @@ app.use(express.json());
 
 // 1. Basic Health Checks
 app.get("/", (req, res) => {
+    console.log("hi")
   res.send("API is running 🚀");
 });
 
@@ -125,4 +126,5 @@ socket.on('send_message', async (data) => {
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server & Socket running on http://10.101.74.100:${PORT} - server.js:126`);
 });
+
 
