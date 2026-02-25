@@ -15,9 +15,7 @@ export const sendOTPEmail = async (userEmail, otp) => {
       pass: process.env.EMAIL_PASS,
     },
     // Optional: This can help bypass some strict network proxy issues
-    tls: {
-      rejectUnauthorized: false 
-    }
+    family: 4
   });
 
   const mailOptions = {
@@ -43,3 +41,4 @@ export const sendOTPEmail = async (userEmail, otp) => {
 
 // 2. Default Export
 export default sendOTPEmail;
+
