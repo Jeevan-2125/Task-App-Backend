@@ -3,42 +3,38 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// 1. Named Export
-export const sendOTPEmail = async (userEmail, otp) => {
-  // Move transporter inside the function to ensure process.env is ready
-  const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, // true for 465, false for other ports
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
-    },
-    // Optional: This can help bypass some strict network proxy issues
-    family: 4
-  });
+// Reusable transporter (defined outside the function for better performance)
+const transporter = nodemailer.createTransport({
+  host: 'smtp-relay.brevo.com',
+  port: 587,
+  secure: false, 
+  auth: {
+    user: process.env.BREVO_SMTP_USER,
+    pass: process.env.BREVO_SMTP_PASS,
+  },
+});
 
+export const sendOTPEmail = async (userEmail, otp) => {
   const mailOptions = {
-    from: `"Task App Support" <${process.env.EMAIL_USER}>`,
+    // Make sure this email matches your Brevo account email exactly
+    from: `"Task App Support" <${process.env.BREVO_SMTP_USER}>`, 
     to: userEmail,
-    subject: 'Your OTP Code',
-    text: `Your OTP is ${otp}`,
+    subject: 'Your Password Reset OTP Code',
+    text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
+    // Optional: Add some basic HTML to make it look nicer
+    html: `<p>Your OTP is <b>${otp}</b>.</p><p>It is valid for 10 minutes. Do not share this code with anyone.</p>`
   };
 
-
-
   try {
-    // Add this temporary line to see what keys exist
-    console.log("All Env Keys: - otp.service.js:34", Object.keys(process.env).filter(k => k.includes('EMAIL')));
-    
-    await transporter.sendMail(mailOptions);
+    const info = await transporter.sendMail(mailOptions);
+    console.log("Email sent successfully! Message ID:", info.messageId);
     return { success: true };
   } catch (error) {
-    console.error("Debug Credentials > User: - otp.service.js:39", process.env.EMAIL_USER ? "Present" : "Missing", "| Pass:", process.env.EMAIL_PASS ? "Present" : "Missing");
+    console.error("Brevo Email Error:", error.message);
     throw error;
   }
 };
 
-// 2. Default Export
 export default sendOTPEmail;
+
 
