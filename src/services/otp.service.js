@@ -13,6 +13,7 @@ export const sendOTPEmail = async (userEmail, otp) => {
     subject: "Your Password Reset OTP Code",
     htmlContent: `<p>Your OTP is <b>${otp}</b>. It is valid for 10 minutes.</p>`
   };
+  console.log(process.env.BREVO_SMTP_USER,process.env.BREVO_API_KEY)
 
   try {
     const response = await fetch(url, {
@@ -40,6 +41,7 @@ export const sendOTPEmail = async (userEmail, otp) => {
 };
 
 export default sendOTPEmail;
+
 
 
 
