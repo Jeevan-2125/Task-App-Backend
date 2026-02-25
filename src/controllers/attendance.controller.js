@@ -9,7 +9,7 @@ export const getAttendanceHistory = async (req, res) => {
         const [rows] = await db.query(`
             SELECT 
                 DATE_FORMAT(a.date, '%Y-%m-%d') as date,
-                DATE_FORMAT(a.login_time, '%h:%i %p') as login, 
+                a.login_time as login,
                 a.login_time as raw_login_time,
                 a.logout_time,
                 a.status as original_status,
@@ -25,14 +25,15 @@ export const getAttendanceHistory = async (req, res) => {
         `, [userId, month, year]);
 
         // ✅ FIXED: Mapping 'login' field so frontend record.login is never undefined
-        const history = rows.reduce((acc, row) => {
-            acc[row.date] = { 
-                login: row.login, // This will now show as "09:30 AM"
-                status: row.status,
-                logout_time: row.logout_time 
-            };
-            return acc;
-        }, {});
+       const history = rows.reduce((acc, row) => {
+        acc[row.date] = { 
+            // Send the raw ISO string so the frontend can convert it locally
+            login: row.login, 
+            status: row.status,
+            logout_time: row.logout_time 
+        };
+        return acc;
+    }, {});
 
         res.json({ success: true, history });
     } catch (error) {
@@ -78,7 +79,7 @@ export const handleSession = async (req, res) => {
 
         res.json({ success: true });
     } catch (error) {
-        console.error("HandleSession Error: - attendance.controller.js:81", error);
+        console.error("HandleSession Error: - attendance.controller.js:82", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -136,7 +137,7 @@ export const toggleHoliday = async (req, res) => {
             return res.json({ success: true, message: "Holiday set successfully" });
         }
     } catch (error) {
-        console.error("Database Error: - attendance.controller.js:139", error);
+        console.error("Database Error: - attendance.controller.js:140", error);
         res.status(500).json({ success: false, message: "Database error: " + error.message });
     }
 };
