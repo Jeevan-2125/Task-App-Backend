@@ -1,35 +1,35 @@
 import db from '../db/db.js';
 
-// ✅ Fetch projects assigned to the logged-in employee
+
+// ✅ Fetch projects assigned to the logged-in employee with Team Members
 export const getMyProjects = async (req, res) => {
     try {
         const userId = req.user.id;
 
-        // Query to get projects where the user is a member
+        // ✅ FIXED: Fetching file_path and original_file_name from the project_files table
         const [projects] = await db.query(`
             SELECT 
-                p.id, 
-                p.name, 
-                p.description, 
-                p.status, 
+                p.*, 
                 DATE_FORMAT(p.start_date, '%Y-%m-%d') as start_date, 
-                DATE_FORMAT(p.end_date, '%Y-%m-%d') as end_date
+                DATE_FORMAT(p.end_date, '%Y-%m-%d') as end_date,
+                (SELECT GROUP_CONCAT(CONCAT(u.name, ' (', pm.role, ')') SEPARATOR ', ') 
+                 FROM project_members pm 
+                 JOIN users u ON pm.user_id = u.id 
+                 WHERE pm.project_id = p.id) as team_members,
+                (SELECT file_path FROM project_files WHERE project_id = p.id ORDER BY uploaded_at DESC LIMIT 1) as file_path,
+                (SELECT file_name FROM project_files WHERE project_id = p.id ORDER BY uploaded_at DESC LIMIT 1) as original_file_name
             FROM projects p
             INNER JOIN project_members pm ON p.id = pm.project_id
             WHERE pm.user_id = ?
             ORDER BY p.created_at DESC
         `, [userId]);
 
-        res.json({
-            success: true,
-            projects: projects
-        });
+        res.json({ success: true, projects });
     } catch (error) {
-        console.error("Project Fetch Error: - project.controller.js:28", error);
+        console.error("Project Fetch Error: - project.controller.js:29", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
-
 // ✅ Admin Project Creation & Multi-Member Assignment
 export const createProject = async (req, res) => {
     const { name, description, status, startDate, endDate, members } = req.body;
@@ -143,16 +143,3 @@ export const getEmployeeProjects = async (req, res) => {
     }
 };
 
-// export const updateProjectStatus = async (req, res) => {
-//     try {
-//         const { projectId, status } = req.body;
-//         // Verify user is assigned to this project or is admin
-//         await db.query(
-//             'UPDATE projects SET status = ? WHERE id = ?',
-//             [status, projectId]
-//         );
-//         res.json({ success: true, message: 'Status updated' });
-//     } catch (err) {
-//         res.status(500).json({ success: false, message: 'Database error' });
-//     }
-// };
