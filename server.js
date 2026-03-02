@@ -6,7 +6,6 @@ import authRoutes from "./src/routes/auth.routes.js";
 import dashboardRoutes from './src/routes/dashboard.routes.js';
 import attendanceRoutes from './src/routes/attendance.routes.js';
 import userTabs from './src/routes/user.routes.js';
-// import projectRoutes from './src/routes/project.route.js';
 import projectRoutes from './src/routes/project.route.js';
 import taskRoutes from './src/routes/task.route.js';
 import { createServer } from 'http'; 
@@ -16,7 +15,9 @@ import leaveRoutes from './src/routes/leave.routes.js';
 import adminRoutes from './src/routes/admin.routes.js';
 import notificationRoutes from './src/routes/notification.routes.js';
 import userRoutes from './src/routes/user.routes.js';
-
+import presenceRoutes from './src/routes/presence.routes.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 
 
@@ -25,10 +26,12 @@ dotenv.config();
 const PORT = process.env.PORT || 5000;
 const app = express();
 const httpServer = createServer(app); 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const io = new Server(httpServer, {
     cors: {
         origin: "*", 
-        methods: ["GET", "POST"]
+        methods: ["GET", "POST","PUT","DELETE"]
     }
 });
 
@@ -37,7 +40,6 @@ app.use(express.json());
 
 // 1. Basic Health Checks
 app.get("/", (req, res) => {
-    console.log("hi")
   res.send("API is running 🚀");
 });
 
@@ -57,17 +59,20 @@ app.use('/api/leaves', leaveRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/presence', presenceRoutes);
+// This allows the mobile app to access files via http://your-backend-url/uploads/filename.pdf
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use((req, res) => {
   res.status(404).json({ message: `API route not found: ${req.originalUrl}` });
 });
 // ✅ SOCKET.IO LOGIC
 io.on('connection', (socket) => {
-    console.log('User connected: - server.js:64', socket.id);
+    console.log('User connected: - server.js:70', socket.id);
 
     // Join a specific room (Project or Task ID)
     socket.on('join_room', (roomID) => {
         socket.join(roomID);
-        console.log(`User ${socket.id} joined room: ${roomID} - server.js:69`);
+        console.log(`User ${socket.id} joined room: ${roomID} - server.js:75`);
     });
 
 // Listen for typing events
@@ -90,9 +95,9 @@ io.on('connection', (socket) => {
             [data.task_id || data.project_id]
         );
 
-        console.log(`Message handled for room ${data.room} - server.js:92`);
+        console.log(`Message handled for room ${data.room} - server.js:98`);
     } catch (err) {
-        console.error("Notification trigger error: - server.js:94", err);
+        console.error("Notification trigger error: - server.js:100", err);
     }
 });
 
@@ -115,16 +120,17 @@ socket.on('send_message', async (data) => {
         });
 
     } catch (err) {
-        console.error("Chat persistence error: - server.js:117", err);
+        console.error("Chat persistence error: - server.js:123", err);
     }
 });
     socket.on('disconnect', () => {
-        console.log('User disconnected - server.js:121');
+        console.log('User disconnected - server.js:127');
     });
 });
 
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server & Socket running on http://10.101.74.100:${PORT} - server.js:126`);
-});
 
+
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server & Socket running on http://10.101.74.100:${PORT} - server.js:134`);
+});
 
