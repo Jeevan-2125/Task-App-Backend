@@ -28,13 +28,14 @@ dotenv.config();
 const db = mysql.createPool({
   // Use the hostname provided in your screenshot
   host: 'srv1327.hstgr.io', 
-  user: 'u118553460_app1',
+  user: 'u118553460_web1',
   password: '{TRANSact]@1034', 
-  database: 'u118553460_app',
+  database: 'u118553460_web',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  enableKeepAlive: true
+  enableKeepAlive: true,
+  timezone: '+05:30'
 });
 
 export default db;
