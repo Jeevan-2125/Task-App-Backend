@@ -8,8 +8,8 @@ import { getClientIP, getUserAgent } from '../utils/ip.util.js';
 /* ---------------- REGISTER ---------------- */
 export const registerUser = async (req, res) => {
     try {
-        const { name, email, password,gender } = req.body;
-        console.log("incoming data - auth.controller.js:12",req.body);
+        const { name, email, password, gender } = req.body;
+        console.log("incoming data - auth.controller.js:12", req.body);
         
 
         if (!name || !email || !password) {
@@ -22,14 +22,25 @@ export const registerUser = async (req, res) => {
         }
 
         const hashed = await bcrypt.hash(password, 10);
+        
+        // ✅ FIXED: Added updated_at, last_seen, and last_activity to prevent the "0000-00-00" crash!
         const [result] = await db.query(
-            'INSERT INTO users (name, email, password, role, status, gender, created_at) VALUES (?, ?, ?, ?, ?,?, NOW())',
-            [name, email, hashed, 'user', 'active',gender]
+            `INSERT INTO users (
+                name, email, password, role, status, gender, 
+                created_at, updated_at, last_seen, last_activity
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, 
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), 
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), 
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), 
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)
+            )`,
+            [name, email, hashed, 'user', 'active', gender]
         );
 
         res.json({ success: true, userId: result.insertId });
     } catch (err) {
-        console.error("Register Error: - auth.controller.js:32", err);
+        console.error("Register Error: - auth.controller.js:43", err);
         res.status(500).json({ success: false, message: 'Server error during registration' });
     }
 };
@@ -62,14 +73,18 @@ export const loginUser = async (req, res) => {
             { expiresIn: '1d' }
         );
 
-        // 4. Record Attendance Log (using your table structure)
+        // 4. Record Attendance Log (✅ FIXED: Replaced NOW() with IST Calculator)
         await db.query(
-            'INSERT INTO attendance (user_id, login_time, ip_address, user_agent) VALUES (?, NOW(), ?, ?)',
+            `INSERT INTO attendance (user_id, login_time, date, ip_address, user_agent) 
+             VALUES (?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)), ?, ?)`,
             [user.id, ip, ua]
         );
 
-        // 5. Update user activity timestamp
-        await db.query('UPDATE users SET last_activity = NOW() WHERE id = ?', [user.id]);
+        // 5. Update user activity timestamp (✅ FIXED: Replaced NOW() with IST Calculator)
+        await db.query(
+            'UPDATE users SET last_activity = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE) WHERE id = ?', 
+            [user.id]
+        );
 
         // 6. Return success with user role for redirection
         res.json({
@@ -78,16 +93,15 @@ export const loginUser = async (req, res) => {
             user: { 
                 id: user.id, 
                 name: user.name, 
-                role: user.role, // Explicitly returning 'admin' or 'user'
-                gender:user.gender
+                role: user.role, 
+                gender: user.gender
             }
         });
     } catch (err) {
-        console.error("Login Error: - auth.controller.js:86", err);
+        console.error("Login Error: - auth.controller.js:101", err);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 };
-
 /* ---------------- FORGOT PASSWORD ---------------- */
 export const forgotPassword = async (req, res) => {
     try {
@@ -109,7 +123,7 @@ export const forgotPassword = async (req, res) => {
         await sendOTPEmail(email, otp); // Match the capitalized import at the top
         res.json({ success: true, message: 'OTP sent successfully' });
     } catch (err) {
-        console.error("Forgot Pwd Error: - auth.controller.js:112", err);
+        console.error("Forgot Pwd Error: - auth.controller.js:126", err);
         res.status(500).json({ success: false, message: 'Server error during OTP generation' });
     }
 };
@@ -137,57 +151,7 @@ export const verifyOtpAndReset = async (req, res) => {
 
         res.json({ success: true, message: 'Password updated successfully' });
     } catch (err) {
-        console.error("Reset Pwd Error: - auth.controller.js:140", err);
+        console.error("Reset Pwd Error: - auth.controller.js:154", err);
         res.status(500).json({ success: false, message: 'Server error during password reset' });
     }
 };
-
-
-// export const register = async (req, res) => {
-//     try {
-//         const { name, email, gender, password } = req.body; // 👈 Catch gender here
-
-//         // Hash password logic...
-//         const hashedPassword = await bcrypt.hash(password, 10);
-
-//         const query = `
-//             INSERT INTO users (name, email, gender, password, role, status, created_at) 
-//             VALUES (?, ?, ?, ?, 'user', 'active', NOW())
-//         `;
-
-//         // Pass gender into the array
-//         const [result] = await db.query(query, [name, email, gender, hashedPassword]);
-
-//         res.status(201).json({ success: true, message: "User registered" });
-//     } catch (error) {
-//         console.error(error);
-//         res.status(500).json({ success: false, message: "Server error" });
-//     }
-// };
-
-
-
-// export const register = async (req, res) => {
-//     try {
-//         // 1. Destructure gender from the incoming request
-//         const { name, email, password, gender } = req.body; 
-
-//         // ... (password hashing logic)
-
-//         // 2. Ensure gender is included in the query and the values array
-//         const query = `
-//             INSERT INTO users (name, email, password, gender, role, status, created_at) 
-//             VALUES (?, ?, ?, ?, 'user', 'active', NOW())
-//         `;
-
-//         // Make sure 'gender' is in the exact same position as the '?' in the query
-//         const [result] = await db.query(query, [name, email, hashedPassword, gender]);
-
-//         res.status(201).json({ success: true, message: "User registered successfully" });
-//     } catch (error) {
-//         console.error("Registration Error: - auth.controller.js:184", error);
-//         res.status(500).json({ success: false, message: "Server error" });
-//     }
-// };
-
-
