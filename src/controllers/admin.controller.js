@@ -7,61 +7,51 @@ export const getAdminDashboard = async (req, res) => {
                 (SELECT COUNT(*) FROM users WHERE role='user') as total_users,
                 (SELECT COUNT(DISTINCT user_id) FROM attendance WHERE DATE(login_time) = CURDATE()) as present_today,
                 (SELECT COUNT(*) FROM user_leaves 
-                 WHERE status='Approved' 
-                 AND CURDATE() BETWEEN start_date AND end_date) as on_leave,
+                 WHERE status='approved' AND leave_date = CURDATE()) as on_leave,
                 (SELECT COUNT(*) FROM user_leaves WHERE status='pending') as pending_leaves,
                 (SELECT COUNT(*) FROM tasks WHERE status='completed') as tasks_done
         `);
-
-        const [activeUsers] = await db.query(`
-            SELECT id, name, email, status FROM users WHERE role='user'
-        `);
-
-        // ✅ Use 'return' to ensure the function stops here
-        return res.json({ 
-            success: true, 
-            stats: stats[0], 
-            activeUsers 
-        });
-    } catch (err) {
-        console.error("Dashboard Error at - admin.controller.js:27", err.message);
-        return res.status(500).json({ 
-            success: false, 
-            message: 'Dashboard data fetch failed: ' + err.message 
-        });
-    }
+        // ... rest of your code ...
+        res.json({ success: true, stats: stats[0] });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
-
 export const getAdminAttendanceSummary = async (req, res) => {
     try {
         const { month, year } = req.query;
         const adminId = req.user.id;
 
-        // 1. Fetch current active session
+        // 1. Fetch current active session for the admin
         const [currentSession] = await db.query(
             `SELECT login_time FROM attendance 
              WHERE user_id = ? AND logout_time IS NULL 
              ORDER BY login_time DESC LIMIT 1`, [adminId]
         );
 
-        // 2. ✅ FIXED: Changed 'leave_applications' to 'user_leaves' 
-        // because 'leave_applications' does not exist in your DB.
+        // 2. Fetch pending leaves
         const [leaveCount] = await db.query(
             "SELECT COUNT(*) as count FROM user_leaves WHERE status = 'pending'"
         );
 
-        // 3. Fetch Monthly Summary
+        // 3. Fetch Monthly Summary + Real-Time Presence Subqueries
         const [summary] = await db.query(`
             SELECT 
+                u.id as user_id,
                 u.name as user_name,
                 u.email,
-                u.status as current_status,
-                u.last_login as last_logon,
+                u.last_activity,
+                
+                -- Real-time Presence checks (looks at TODAY's activity only)
+                (SELECT login_time FROM attendance a2 WHERE a2.user_id = u.id AND DATE(a2.login_time) = CURDATE() AND a2.logout_time IS NULL ORDER BY a2.login_time DESC LIMIT 1) as current_session,
+                (SELECT logout_time FROM attendance a3 WHERE a3.user_id = u.id AND a3.logout_time IS NOT NULL AND DATE(a3.logout_time) = CURDATE() ORDER BY a3.logout_time DESC LIMIT 1) as last_logout,
+                
+                -- Global Last Login (Overall)
+                (SELECT login_time FROM attendance a4 WHERE a4.user_id = u.id ORDER BY a4.login_time DESC LIMIT 1) as last_login,
+                
+                -- Monthly Aggregates (filtered by selected month/year)
                 COUNT(a.id) as present_days,
+                SUM(CASE WHEN TIME(a.login_time) > '10:30:00' THEN 1 ELSE 0 END) as late_days,
                 SUM(CASE WHEN a.work_hours >= 8 THEN 1 ELSE 0 END) as full_days,
-                SUM(CASE WHEN a.work_hours < 8 AND a.work_hours > 0 THEN 1 ELSE 0 END) as half_days,
-                IFNULL(SUM(a.work_hours), 0) as total_hours,
-                IFNULL(ROUND(AVG(a.work_hours), 1), 0) as avg_per_day
+                SUM(CASE WHEN a.work_hours < 8 AND a.work_hours > 0 THEN 1 ELSE 0 END) as half_days
             FROM users u
             LEFT JOIN attendance a ON u.id = a.user_id 
                 AND MONTH(a.login_time) = ? AND YEAR(a.login_time) = ?
@@ -69,23 +59,59 @@ export const getAdminAttendanceSummary = async (req, res) => {
             GROUP BY u.id
         `, [month, year, adminId]);
 
-        // ✅ FIXED: Consolidated into ONE res.json response. 
-        // Previously you had two res.json calls, which caused the "headers already sent" crash.
+        // 4. Process presence logic and absent days in Node
+        const currentTime = new Date();
+        const processedSummary = summary.map(user => {
+            let presenceStatus = 'offline';
+            
+            // Check real-time presence
+            if (user.current_session) {
+                presenceStatus = 'online';
+            } else if (user.last_logout) {
+                const logoutTime = new Date(user.last_logout);
+                const diffSeconds = (currentTime - logoutTime) / 1000;
+                if (diffSeconds <= 300) presenceStatus = 'recent';
+            } else if (user.last_activity) {
+                 const activityTime = new Date(user.last_activity);
+                 const diffSeconds = (currentTime - activityTime) / 1000;
+                 if (diffSeconds <= 60) presenceStatus = 'online';
+                 else if (diffSeconds <= 300) presenceStatus = 'recent';
+            }
+
+            // Calculate Absent Days (Defaulting to a 22 working day month)
+            const workingDays = 22; 
+            let absent_days = workingDays - (user.present_days || 0);
+            if (absent_days < 0) absent_days = 0;
+
+            return {
+                user_id: user.user_id,
+                user_name: user.user_name,
+                email: user.email,
+                current_status: presenceStatus, // Yields 'online', 'recent', or 'offline'
+                last_login: user.last_login,
+                present_days: user.present_days || 0,
+                full_days: user.full_days || 0,
+                half_days: user.half_days || 0,
+                late_days: user.late_days || 0,
+                absent_days: absent_days
+            };
+        });
+
+        // 5. Send unified response mapped perfectly for attendance.tsx
         return res.json({
             success: true,
             currentSession: currentSession[0] || null,
-            pendingLeavesCount: leaveCount[0].count,
-            summary: summary || []
+            pendingLeavesCount: leaveCount[0]?.count || 0,
+            summary: processedSummary
         });
 
     } catch (err) {
-        console.error("Attendance Summary Error: - admin.controller.js:82", err.message);
+        console.error("Attendance Summary Error: - admin.controller.js:109", err.message);
         if (!res.headersSent) {
             return res.status(500).json({ success: false, message: "Internal Server Error" });
         }
     }
 };
-
 
 
 // ✅ Ensur
@@ -116,18 +142,50 @@ export const sendAnnouncement = async (req, res) => {
 };
 
 
-
 export const updateLeaveStatus = async (req, res) => {
     const { id, status } = req.body;
+    
+    console.log(`[Leave] Admin is updating leave ID: ${id} to Status: ${status} - admin.controller.js:148`);
+
     try {
+        // 1. Safely fetch the leave request using SELECT * so we don't guess column names!
+        const [leaveRequest] = await db.query('SELECT * FROM user_leaves WHERE id = ?', [id]);
+
+        if (leaveRequest.length === 0) {
+            console.log("[Leave] Error: Leave request not found in database. - admin.controller.js:155");
+            return res.status(404).json({ success: false, message: "Leave request not found" });
+        }
+
+        const userId = leaveRequest[0].user_id;
+        // Check multiple common column names just in case
+        const leaveType = leaveRequest[0].leave_type || leaveRequest[0].type || leaveRequest[0].reason || 'Leave';
+        
+        console.log(`[Leave] Found User ID: ${userId}, Type: ${leaveType} - admin.controller.js:163`);
+
+        // 2. Update the leave status
         await db.query('UPDATE user_leaves SET status = ? WHERE id = ?', [status, id]);
+        console.log("[Leave] Status updated successfully in user_leaves table. - admin.controller.js:167");
+
+        // 3. Format the text for the notification
+        const formattedStatus = status.charAt(0).toUpperCase() + status.slice(1);
+        const notifTitle = `Leave ${formattedStatus}`;
+        const notifMessage = `Your request for ${leaveType} has been ${status.toLowerCase()} by the Admin.`;
+
+        // 4. Insert the notification safely
+        await db.query(`
+            INSERT INTO notifications (user_id, type, title, message, is_read, related_id, created_at) 
+            VALUES (?, 'leave_update', ?, ?, 0, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE))
+        `, [userId, notifTitle, notifMessage, id]);
+        
+        console.log("[Leave] Notification successfully inserted into database! - admin.controller.js:180");
+
         res.json({ success: true, message: `Leave ${status}` });
     } catch (err) {
+        // 🚨 THIS WILL TELL US EXACTLY WHAT WENT WRONG
+        console.error("🚨 LEAVE UPDATE CRASH 🚨: - admin.controller.js:185", err.message);
         res.status(500).json({ success: false, message: err.message });
     }
 };
-
-
 export const getAttendance = async (req, res) => {
     try {
         const { month } = req.query; // e.g., '2026-02'
@@ -150,7 +208,7 @@ export const getAttendance = async (req, res) => {
 
         res.json({ success: true, summary: rows });
     } catch (err) {
-        console.error("Attendance Summary Error: - admin.controller.js:153", err);
+        console.error("Attendance Summary Error: - admin.controller.js:211", err);
         res.status(500).json({ success: false, message: 'Failed to fetch attendance summary' });
     }
 };
@@ -170,165 +228,12 @@ export const getUserAttendanceLogs = async (req, res) => {
         
         res.json({ success: true, logs });
     } catch (err) {
-        console.error("User Logs Error: - admin.controller.js:173", err);
+        console.error("User Logs Error: - admin.controller.js:231", err);
         res.status(500).json({ success: false, message: 'Failed to fetch logs' });
     }
 };
 
 
-
-// export const createTask = async (req, res) => {
-//     try {
-//         const { title, description, assigned_to, due_date } = req.body;
-//         const created_by = req.user.id; // From your auth middleware
-
-//         // Map data to your tasks table columns
-//         const [result] = await db.query(
-//             `INSERT INTO tasks 
-//             (title, description, assigned_to, created_by, due_date, status, priority, created_at) 
-//             VALUES (?, ?, ?, ?, ?, 'pending', 'medium', NOW())`,
-//             [title, description, assigned_to, created_by, due_date]
-//         );
-
-//         if (result.affectedRows > 0) {
-//             // Optional: Create a notification for the user
-//             await db.query(
-//                 `INSERT INTO notifications (user_id, type, title, message, related_id, created_at) 
-//                 VALUES (?, 'task_assigned', 'New Task Assigned', ?, ?, NOW())`,
-//                 [assigned_to, `You have been assigned: ${title}`, result.insertId]
-//             );
-
-//             return res.json({ success: true, message: "Task created and user notified" });
-//         }
-
-//         res.status(400).json({ success: false, message: "Failed to create task" });
-//     } catch (err) {
-//         console.error("Create Task Error: - admin.controller.js:206", err.message);
-//         res.status(500).json({ success: false, message: "Server Database Error" });
-//     }
-// };
-
-
-// export const createTask = async (req, res) => {
-//     try {
-//         const { title, description, assigned_to, due_date } = req.body;
-//         const created_by = req.user.id; 
-
-//         // 1. Title, 2. Description, 3. Assigned_to, 4. Created_by, 5. Due_date, 6. Status, 7. Priority, 8. Created_at
-//         const [result] = await db.query(
-//             `INSERT INTO tasks 
-//             (title, description, assigned_to, created_by, due_date, status, priority, created_at) 
-//             VALUES (?, ?, ?, ?, ?, 'pending', 'medium', NOW())`,
-//             // Count must match the number of '?' in the query
-//             [title, description, assigned_to, created_by, due_date] 
-//         );
-
-//         /* ❌ WHY IT WAS FAILING:
-//            Your SQL query has 8 columns listed.
-//            You only have 5 '?' placeholders.
-//            SQL needs 8 values if you list 8 columns.
-//         */
-
-//         // ✅ FIXED QUERY:
-//         const [fixedResult] = await db.query(
-//             `INSERT INTO tasks 
-//             (title, description, assigned_to, created_by, due_date, status, priority, created_at) 
-//             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`, // Added placeholders for status and priority
-//             [title, description, assigned_to, created_by, due_date, 'pending', 'medium']
-//         );
-
-//         if (fixedResult.affectedRows > 0) {
-//             await db.query(
-//                 `INSERT INTO notifications (user_id, type, title, message, related_id, created_at) 
-//                 VALUES (?, 'task_assigned', 'New Task Assigned', ?, ?, NOW())`,
-//                 [assigned_to, `You have been assigned: ${title}`, fixedResult.insertId]
-//             );
-
-//             return res.json({ success: true, message: "Task created and user notified" });
-//         }
-
-//         res.status(400).json({ success: false, message: "Failed to create task" });
-//     } catch (err) {
-//         console.error("Create Task Error: - admin.controller.js:252", err.message);
-//         res.status(500).json({ success: false, message: "Server Database Error" });
-//     }
-// };
-
-// export const createTask = async (req, res) => {
-//     try {
-//         const { title, description, assigned_to, due_date } = req.body;
-//         const created_by = req.user.id; 
-
-//         // Columns listed: 8
-//         // Values (?) provided: 8
-//         const query = `
-//             INSERT INTO tasks 
-//             (title, description, assigned_to, created_by, due_date, status, priority, created_at) 
-//             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-//         `;
-
-//         const values = [
-//             title,           // 1
-//             description,     // 2
-//             assigned_to,     // 3
-//             created_by,      // 4
-//             due_date || null,// 5
-//             'pending',       // 6 (maps to status)
-//             'medium',        // 7 (maps to priority)
-//             // NOW() handles the 8th value (created_at) automatically
-//         ];
-
-//         const [result] = await db.query(query, values);
-
-//         if (result.affectedRows > 0) {
-//             return res.json({ success: true, message: "Task created successfully" });
-//         }
-//     } catch (err) {
-//         console.error("Database Error: - admin.controller.js:287", err.message);
-//         res.status(500).json({ success: false, message: "Server Database Error" });
-//     }
-// };
-
-
-
-// --- Inside admin.controller.js ---
-
-// export const createTask = async (req, res) => {
-//     try {
-//         const { title, description, assigned_to, due_date } = req.body;
-//         const created_by = req.user.id; 
-
-//         // 1. Column Names (Total 8 columns mentioned here)
-//         const sql = `
-//             INSERT INTO tasks 
-//             (title, description, assigned_to, created_by, due_date, status, priority, created_at) 
-//             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-//         `;
-
-//         // 2. Corresponding Values (Total 7 placeholders '?' + 1 SQL function 'NOW()')
-//         const values = [
-//             title,           // ? 1
-//             description,     // ? 2
-//             assigned_to,     // ? 3
-//             created_by,      // ? 4
-//             due_date || null,// ? 5
-//             'pending',       // ? 6
-//             'medium'         // ? 7
-//         ];
-
-//         // Execute the query
-//         const [result] = await db.query(sql, values);
-
-//         if (result.affectedRows > 0) {
-//             return res.json({ success: true, message: "Task created successfully" });
-//         }
-        
-//     } catch (err) {
-//         // This is where your line 287 error log is coming from
-//         console.error("Database Error: - admin.controller.js:328", err.message);
-//         res.status(500).json({ success: false, message: "Server Database Error" });
-//     }
-// };
 
 
 
@@ -365,27 +270,10 @@ export const createTask = async (req, res) => {
         return res.json({ success: true, message: `Task assigned to ${assigned_to.length} users` });
         
     } catch (err) {
-        console.error("Create Task Error: - admin.controller.js:368", err.message);
+        console.error("Create Task Error: - admin.controller.js:273", err.message);
         res.status(500).json({ success: false, message: "Server Database Error" });
     }
 };
-
-// export const getMyProjects = async (req, res) => {
-//     try {
-//         const adminId = req.user.id; // From verifyToken middleware
-//         const [projects] = await db.query(`
-//             SELECT p.* FROM projects p
-//             WHERE p.added_by = ? 
-//             OR p.id IN (SELECT project_id FROM project_members WHERE user_id = ?)
-//             ORDER BY p.created_at DESC
-//         `, [adminId, adminId]);
-        
-//         res.json({ success: true, projects });
-//     } catch (err) {
-//         res.status(500).json({ success: false, message: err.message });
-//     }
-// };
-
 
 
 export const getMasterAnalytics = async (req, res) => {
@@ -393,24 +281,64 @@ export const getMasterAnalytics = async (req, res) => {
         const today = new Date().toISOString().split('T')[0];
 
         // 1. Daily Analytics & Attendance Breakdown
-        // Fetch users present today (logged in)
         const [presentToday] = await db.query(
             `SELECT u.id, u.name, u.email FROM users u 
              JOIN attendance a ON u.id = a.user_id 
              WHERE DATE(a.login_time) = ?`, [today]
         );
 
-        // ✅ FIXED: Updated to use start_date and end_date
-        // We check if 'today' falls between the start and end of the leave
+      // 1. Update this query to fetch the id, name, and leave details
         const [onLeaveToday] = await db.query(
-            `SELECT u.name FROM users u 
+            `SELECT 
+                u.id, 
+                u.name, 
+                l.leave_type, 
+                l.reason 
+             FROM users u 
              JOIN user_leaves l ON u.id = l.user_id 
              WHERE ? BETWEEN l.start_date AND l.end_date 
              AND l.status = 'Approved'`, [today]
         );
+        
+        // 🌟 FIXED: Real-time Presence Logic for Active Personnel Grid 🌟
+        const [allStaffRaw] = await db.query(`
+            SELECT 
+                u.id, u.name, u.email, u.last_activity,
+                (SELECT login_time FROM attendance a WHERE a.user_id = u.id AND DATE(a.login_time) = CURDATE() AND a.logout_time IS NULL ORDER BY a.login_time DESC LIMIT 1) as current_session,
+                (SELECT logout_time FROM attendance a WHERE a.user_id = u.id AND a.logout_time IS NOT NULL AND DATE(a.logout_time) = CURDATE() ORDER BY a.logout_time DESC LIMIT 1) as last_logout
+            FROM users u 
+            WHERE u.role != 'admin'
+        `);
 
-        // Fetch all staff to calculate absents
-        const [allStaff] = await db.query("SELECT id, name, email, status FROM users WHERE role != 'admin'");
+        const currentTime = new Date();
+        
+        const allStaff = allStaffRaw.map(user => {
+            let presenceStatus = 'offline'; // Default to offline (#95a5a6)
+
+            if (user.current_session) {
+                presenceStatus = 'online'; // Currently logged in (#2ecc71)
+            } else if (user.last_logout) {
+                // Check if they logged out within the last 5 mins (300 seconds)
+                const logoutTime = new Date(user.last_logout);
+                const diffSeconds = (currentTime - logoutTime) / 1000;
+                if (diffSeconds <= 300) {
+                    presenceStatus = 'recent'; // (#3498db)
+                }
+            } else if (user.last_activity) {
+                // Fallback check against last API activity
+                 const activityTime = new Date(user.last_activity);
+                 const diffSeconds = (currentTime - activityTime) / 1000;
+                 if (diffSeconds <= 60) presenceStatus = 'online';
+                 else if (diffSeconds <= 300) presenceStatus = 'recent';
+            }
+
+            return {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                status: presenceStatus // This overrides the old static status
+            };
+        });
 
         // 2. Task Overview (Pending & Completed)
         const [allTasks] = await db.query(`
@@ -435,26 +363,25 @@ export const getMasterAnalytics = async (req, res) => {
             progress_count: allTasks.filter(t => t.status === 'in_progress').length,
         };
 
-        // ✅ Use return to prevent header errors
-        return res.json({
+      return res.json({
             success: true,
             stats,
             breakdown: {
                 present: presentToday,
-                absent: absentUsers
+                absent: absentUsers,
+                on_leave: onLeaveToday // <--- ADD THIS LINE
             },
             tasks: allTasks, 
             users: allStaff 
         });
 
     } catch (err) {
-        console.error("Dashboard Data Error at - admin.controller.js:451", err.message);
+        console.error("Dashboard Data Error at - admin.controller.js:379", err.message);
         if (!res.headersSent) {
             return res.status(500).json({ success: false, message: "Internal Server Error" });
         }
     }
 };
-
 
 
 
@@ -469,6 +396,8 @@ export const getProjectOverview = async (req, res) => {
                 p.name as title, 
                 p.description, 
                 p.status, 
+                p.start_date,    /* ✅ ADDED: Fetches start date for the modal */
+                p.end_date,      /* ✅ ADDED: Fetches due date for the modal */
                 p.created_at,
                 u.name as assignee_name,
                 'medium' as priority 
@@ -480,7 +409,8 @@ export const getProjectOverview = async (req, res) => {
         // 2. Calculate Stats based on project status from your DB
         const stats = {
             total: projects.length,
-            ongoing: projects.filter(p => p.status === 'active' || p.status === 'planning').length,
+            // ✅ ADDED 'pending' so newly created projects count as ongoing
+            ongoing: projects.filter(p => p.status === 'active' || p.status === 'planning' || p.status === 'pending').length,
             finished: projects.filter(p => p.status === 'completed').length
         };
 
@@ -490,7 +420,7 @@ export const getProjectOverview = async (req, res) => {
             stats
         });
     } catch (err) {
-        console.error("Project Fetch Error: - admin.controller.js:493", err.message);
+        console.error("Project Fetch Error: - admin.controller.js:423", err.message);
         res.status(500).json({ success: false, message: "Failed to load projects" });
     }
 };
@@ -546,7 +476,7 @@ export const endAttendanceSession = async (req, res) => {
 
         res.json({ success: true, message: "Session ended successfully" });
     } catch (err) {
-        console.error("End Session Error: - admin.controller.js:549", err.message);
+        console.error("End Session Error: - admin.controller.js:479", err.message);
         res.status(500).json({ success: false, message: "Server Error" });
     }
 };
@@ -556,57 +486,52 @@ export const endAttendanceSession = async (req, res) => {
 // Get All Staff for users.tsx
 export const getAllStaff = async (req, res) => {
     try {
-        const [rows] = await db.query(
-            "SELECT id, name, email, role, status, profile_photo FROM users WHERE role != 'admin'"
-        );
-        res.json({ success: true, staff: rows });
+        // 1. Fetch users along with their real-time attendance data
+        const [rows] = await db.query(`
+            SELECT 
+                u.id, u.name, u.email, u.role, u.profile_photo, u.last_activity,
+                (SELECT login_time FROM attendance a WHERE a.user_id = u.id AND DATE(a.login_time) = CURDATE() AND a.logout_time IS NULL ORDER BY a.login_time DESC LIMIT 1) as current_session,
+                (SELECT logout_time FROM attendance a WHERE a.user_id = u.id AND a.logout_time IS NOT NULL AND DATE(a.logout_time) = CURDATE() ORDER BY a.logout_time DESC LIMIT 1) as last_logout
+            FROM users u 
+            WHERE u.role != 'admin'
+        `);
+
+        const currentTime = new Date();
+        
+        // 2. Map through the users and calculate their active/recent/offline status
+        const staffWithPresence = rows.map(user => {
+            let presenceStatus = 'offline'; // Default to offline
+
+            if (user.current_session) {
+                presenceStatus = 'online'; 
+            } else if (user.last_logout) {
+                const logoutTime = new Date(user.last_logout);
+                const diffSeconds = (currentTime - logoutTime) / 1000;
+                if (diffSeconds <= 300) {
+                    presenceStatus = 'recent';
+                }
+            } else if (user.last_activity) {
+                 const activityTime = new Date(user.last_activity);
+                 const diffSeconds = (currentTime - activityTime) / 1000;
+                 if (diffSeconds <= 60) presenceStatus = 'online';
+                 else if (diffSeconds <= 300) presenceStatus = 'recent';
+            }
+
+            return {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                profile_photo: user.profile_photo,
+                status: presenceStatus // This overrides the static database status
+            };
+        });
+
+        res.json({ success: true, staff: staffWithPresence });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 };
-
-// Get Single User Details for user-details.tsx
-// export const getUserDetails = async (req, res) => {
-//     try {
-//         const { userId } = req.params;
-
-//         // 1. Basic User Info
-//         const [user] = await db.query(
-//             "SELECT id, name, email, role, status, profile_photo FROM users WHERE id = ?", 
-//             [userId]
-//         );
-
-//         // 2. Task Stats
-//         const [taskStats] = await db.query(
-//             "SELECT COUNT(*) as total FROM tasks WHERE assigned_to = ?", 
-//             [userId]
-//         );
-
-//         // 3. Project Stats (from project_members table)
-//         const [projectStats] = await db.query(
-//             "SELECT COUNT(*) as total FROM project_members WHERE user_id = ?", 
-//             [userId]
-//         );
-
-//         // 4. Attendance Percentage (Last 30 days)
-//         const [attendance] = await db.query(
-//             "SELECT COUNT(*) as days FROM Attendance WHERE user_id = ? AND login_time >= NOW() - INTERVAL 30 DAY",
-//             [userId]
-//         );
-
-//         res.json({
-//             success: true,
-//             user: user[0],
-//             stats: {
-//                 tasks: taskStats[0].total,
-//                 projects: projectStats[0].total,
-//                 attendance: Math.min(((attendance[0].days / 22) * 100).toFixed(0), 100) + '%'
-//             }
-//         });
-//     } catch (err) {
-//         res.status(500).json({ success: false, message: err.message });
-//     }
-// };
 
 // Suspend/Update Status
 export const updateUserStatus = async (req, res) => {
@@ -621,109 +546,6 @@ export const updateUserStatus = async (req, res) => {
 };
 
 
-
-// export const createProject = async (req, res) => {
-//     // We use a connection from the pool to handle the transaction
-//     const connection = await db.getConnection();
-    
-//     try {
-//         await connection.beginTransaction();
-
-//         const { name, description, start_date, end_date, members } = req.body;
-//         const adminId = req.user.id; // Get the ID of the admin creating the project
-
-//         // 1. Insert into 'projects' table
-//         const [projectResult] = await connection.query(
-//             `INSERT INTO projects (name, description, status, start_date, end_date, created_by, created_at, updated_at) 
-//              VALUES (?, ?, 'active', ?, ?, ?, NOW(), NOW())`,
-//             [name, description, start_date || null, end_date || null, adminId]
-//         );
-
-//         const projectId = projectResult.insertId;
-
-//         // 2. Insert members into 'project_members' table
-//         if (members && members.length > 0) {
-//             // Prepare the data for bulk insertion
-//             const memberData = members.map(userId => [
-//                 projectId,
-//                 userId,
-//                 'member',   // Default role
-//                 adminId,    // added_by
-//                 new Date()  // joined_date
-//             ]);
-
-//             await connection.query(
-//                 "INSERT INTO project_members (project_id, user_id, role, added_by, joined_date) VALUES ?",
-//                 [memberData]
-//             );
-//         }
-
-//         // 3. Log the activity in 'project_activities'
-//         await connection.query(
-//             "INSERT INTO project_activities (project_id, user_id, activity_type, description, created_at) VALUES (?, ?, 'project_created', ?, NOW())",
-//             [projectId, adminId, `Project '${name}' was created by Admin`]
-//         );
-
-//         await connection.commit();
-//         res.status(201).json({ success: true, message: "Project created and members assigned successfully!", projectId });
-
-//     } catch (error) {
-//         await connection.rollback();
-//         console.error("Project Creation Error: - admin.controller.js:672", error);
-//         res.status(500).json({ success: false, message: "Failed to create project: " + error.message });
-//     } finally {
-//         connection.release();
-//     }
-// };
-
-// export const createProject = async (req, res) => {
-//     const connection = await db.getConnection();
-//     try {
-//         await connection.beginTransaction();
-//         const { name, description, start_date, end_date, members } = req.body;
-//         const adminId = req.user.id; 
-
-//         // 1. Insert Project
-//         const [projectResult] = await connection.query(
-//             `INSERT INTO projects (name, description, status, start_date, end_date, created_by, created_at, updated_at) 
-//              VALUES (?, ?, 'active', ?, ?, ?, NOW(), NOW())`,
-//             [name, description, start_date || null, end_date || null, adminId]
-//         );
-//         const projectId = projectResult.insertId;
-
-//         // 2. Prepare Member Data (Include the Admin + Selected Members)
-//         // We use a Set to ensure the adminId isn't duplicated if they were also selected in the UI
-//         const uniqueMembers = Array.from(new Set([...(members || []), adminId]));
-
-//         const memberData = uniqueMembers.map(userId => [
-//             projectId,
-//             userId,
-//             userId === adminId ? 'admin' : 'member', // Role logic
-//             adminId,
-//             new Date()
-//         ]);
-
-//         // 3. Insert into project_members
-//         await connection.query(
-//             "INSERT INTO project_members (project_id, user_id, role, added_by, joined_date) VALUES ?",
-//             [memberData]
-//         );
-
-//         // 4. Log Activity
-//         await connection.query(
-//             "INSERT INTO project_activities (project_id, user_id, activity_type, description, created_at) VALUES (?, ?, 'project_created', ?, NOW())",
-//             [projectId, adminId, `Project '${name}' created and initialized.`]
-//         );
-
-//         await connection.commit();
-//         res.status(201).json({ success: true, projectId });
-//     } catch (error) {
-//         await connection.rollback();
-//         res.status(500).json({ success: false, message: error.message });
-//     } finally {
-//         connection.release();
-//     }
-// };
 
 
 export const getProjectDetails = async (req, res) => {
@@ -757,141 +579,64 @@ export const getProjectDetails = async (req, res) => {
 };
 
 
-// export const punchInController = async (req, res) => {
-//     const { userId, breakType } = req.body;
-//     const now = new Date();
-//     const date = now.toISOString().split('T')[0]; // YYYY-MM-DD
-//     const time = now.toTimeString().split(' ')[0]; // HH:MM:SS
-
-//     try {
-//         const [result] = await db.query(
-//             "INSERT INTO breaks (user_id, break_type, break_date, break_time) VALUES (?, ?, ?, ?)",
-//             [userId, breakType, date, time]
-//         );
-//         res.json({ success: true, id: result.insertId });
-//     } catch (error) {
-//         res.status(500).json({ success: false, message: error.message });
-//     }
-// };
-
-
-// // POST /api/admin/breaks/punch-out
-// export const punchOutController = async (req, res) => {
-//     const { breakId } = req.body;
-//     const now = new Date();
-//     const endTime = now.toTimeString().split(' ')[0]; // HH:MM:SS
-
-//     try {
-//         // ✅ Updates the existing record with the end time 
-//         await db.query(
-//             "UPDATE breaks SET end_time = ? WHERE id = ?",
-//             [endTime, breakId]
-//         );
-//         res.json({ success: true, message: "Punch-out recorded" });
-//     } catch (error) {
-//         res.status(500).json({ success: false, message: error.message });
-//     }
-// };
-
-// backend/src/controllers/admin.controller.js
-
+// FETCH Pending Requests
 export const getPendingLeaves = async (req, res) => {
     try {
         const query = `
             SELECT 
-                ul.id, 
-                ul.user_id, 
-                ul.leave_type, 
-                ul.reason, 
-                ul.start_date, 
-                ul.end_date, 
-                ul.days_requested, 
-                u.name as user_name, 
-                u.email,
-                CASE 
-                    WHEN ul.leave_type = 'SICK LEAVE' THEN u.sick_leave_bal
-                    WHEN ul.leave_type = 'CASUAL LEAVE' THEN u.casual_leave_bal
-                    WHEN ul.leave_type = 'EARNED LEAVE' THEN u.earned_leave_bal
-                    ELSE 0
-                END as current_balance
-            FROM user_leaves ul
-            JOIN users u ON ul.user_id = u.id
-            WHERE ul.status = 'pending'
-            ORDER BY ul.created_at DESC
+                l.id, l.user_id, l.leave_type, l.reason, 
+                l.start_date, l.end_date, l.days_requested,
+                u.name as user_name, u.email,
+                u.sick_leave_bal, u.casual_leave_bal, u.earned_leave_bal
+            FROM user_leaves l
+            JOIN users u ON l.user_id = u.id
+            WHERE l.status = 'pending'
+            ORDER BY l.start_date ASC
         `;
-
         const [rows] = await db.query(query);
         res.json({ success: true, requests: rows });
     } catch (error) {
+        console.error("Fetch Pending Leaves Error: - admin.controller.js:599", error.message);
         res.status(500).json({ success: false, message: error.message });
     }
 };
 
-
+// APPROVE or REJECT
 export const handleLeaveAction = async (req, res) => {
-    const { id, action } = req.body; // id = leave application ID, action = 'Approved' or 'Rejected'
+    // ✅ FIXED: We are now extracting 'action' exactly as the frontend sends it!
+    const { id, action } = req.body; 
 
     try {
-        // 1. Fetch the specific leave request details
-        const [leaveRows] = await db.query(
-            "SELECT user_id, leave_type, days_requested, start_date FROM user_leaves WHERE id = ?", 
-            [id]
-        );
-
-        if (leaveRows.length === 0) {
-            return res.status(404).json({ success: false, message: "Leave request not found." });
+        // 1. Fetch the user who requested the leave
+        const [leaveReq] = await db.query('SELECT * FROM user_leaves WHERE id = ?', [id]);
+        
+        if (leaveReq.length === 0) {
+            return res.status(404).json({ success: false, message: "Leave request not found" });
         }
 
-        const { user_id, leave_type, days_requested, start_date } = leaveRows[0];
+        const userId = leaveReq[0].user_id;
+        const leaveType = leaveReq[0].leave_type || 'Leave';
 
-        // 2. If Approved, update the user's balance
-       // Inside handleLeaveAction in admin.controller.js
-  // Inside handleLeaveAction in admin.controller.js
-if (action === 'Approved') {
-    const [application] = await db.query("SELECT * FROM user_leaves WHERE id = ?", [id]);
-    const { user_id, leave_type, days_requested } = application[0];
+        // 2. Update the leave status in the database
+        await db.query('UPDATE user_leaves SET status = ? WHERE id = ?', [action, id]);
 
-    const colMap = {
-        'SICK LEAVE': 'sick_leave_bal',
-        'CASUAL LEAVE': 'casual_leave_bal',
-        'EARNED LEAVE': 'earned_leave_bal'
-    };
+        // 3. Generate the Notification Text
+        const formattedStatus = action.charAt(0).toUpperCase() + action.slice(1);
+        const notifTitle = `Leave ${formattedStatus}`;
+        const notifMessage = `Your request for ${leaveType} has been ${action} by the Admin.`;
 
-    const col = colMap[leave_type.toUpperCase().trim()];
+        // 4. Insert the Notification
+        await db.query(`
+            INSERT INTO notifications (user_id, type, title, message, is_read, related_id, created_at) 
+            VALUES (?, 'leave_update', ?, ?, 0, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE))
+        `, [userId, notifTitle, notifMessage, id]);
 
-    if (col) {
-        // ✅ Deducts the specific working days (excluding Sundays)
-        await db.query(
-            `UPDATE users SET ${col} = GREATEST(0, ${col} - ?) WHERE id = ?`, 
-            [days_requested, user_id]
-        );
-    }
-}
-            // 3. Update the status of the leave request itself
-        await db.query("UPDATE user_leaves SET status = ? WHERE id = ?", [action, id]);
-
-        // 4. Create a notification for the user
-        const notifType = action === 'Approved' ? 'leave_approved' : 'leave_rejected';
-        const notifTitle = `Leave Request ${action}`;
-        const notifMessage = `Your ${leave_type} request for ${new Date(start_date).toLocaleDateString()} (${days_requested} working days) has been ${action.toLowerCase()}.`;
-
-        await db.query(
-            `INSERT INTO notifications (user_id, type, title, message, related_id) 
-             VALUES (?, ?, ?, ?, ?)`,
-            [user_id, notifType, notifTitle, notifMessage, id]
-        );
-
-        res.json({ 
-            success: true, 
-            message: `Leave ${action} successfully. ${days_requested} days deducted from balance.` 
-        });
-
+        res.json({ success: true, message: `Leave ${action} successfully.` });
     } catch (error) {
-        console.error("Admin Action Error: - admin.controller.js:890", error);
-        res.status(500).json({ success: false, message: "Internal Server Error: " + error.message });
+        console.error("Leave Action Error: - admin.controller.js:636", error);
+        res.status(500).json({ success: false, message: error.message });
     }
 };
-
 
 export const getUserDetails = async (req, res) => {
     const { userId } = req.params;
@@ -927,191 +672,56 @@ export const getUserDetails = async (req, res) => {
 };
 
 
-// export const getMyProjects = async (req, res) => {
-
-//     try {
-//         const userId = req.user.id; // Extract from token
-
-//         const query = `
-//             SELECT 
-//                 p.*,
-//                 (SELECT COUNT(*) FROM project_members WHERE project_id = p.id) as team_count,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id) as total_tasks,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND status = 'completed') as completed_tasks,
-//                 u.name as creator_name
-//             FROM projects p
-//             JOIN project_members pm ON p.id = pm.project_id
-//             JOIN users u ON p.created_by = u.id
-//             WHERE pm.user_id = ?
-//             ORDER BY p.created_at DESC
-//         `;
-
-//         const [projects] = await db.query(query, [userId]);
-
-//         res.json({ success: true, projects });
-//     } catch (error) {
-//         console.error("Fetch Projects Error: - admin.controller.js:902", error);
-//         res.status(500).json({ success: false, message: "Database error" });
-//     }
-// };
-
-
-
-
-// export const getMyProjects = async (req, res) => {
-//     try {
-//         const userId = req.user.id; // User ID from decoded token
-
-//         const query = `
-//             SELECT 
-//                 p.id, p.name, p.description, p.status, p.start_date, p.end_date,
-//                 u.name as creator_name,
-//                 (SELECT COUNT(*) FROM project_members WHERE project_id = p.id) as team_count,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND assigned_to = ?) as my_total_tasks,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND assigned_to = ? AND status = 'completed') as my_completed_tasks,
-//                 DATEDIFF(p.end_date, CURDATE()) as days_remaining
-//             FROM projects p
-//             JOIN project_members pm ON p.id = pm.project_id
-//             JOIN users u ON p.created_by = u.id
-//             WHERE pm.user_id = ?
-//             ORDER BY p.created_at DESC
-//         `;
-
-//         const [projects] = await db.query(query, [userId, userId, userId]);
-//         res.json({ success: true, projects });
-//     } catch (error) {
-//         console.error("Database Error: - admin.controller.js:933", error);
-//         res.status(500).json({ success: false, message: "Server Error" });
-//     }
-// };
-
-// export const getMyProjects = async (req, res) => {
-//     try {
-//         const userId = req.user.id; // User ID from decoded auth token
-
-//         const query = `
-//             SELECT 
-//                 p.id, p.name, p.description, p.status, p.start_date, p.end_date,
-//                 u.name as creator_name,
-//                 (SELECT COUNT(*) FROM project_members WHERE project_id = p.id) as team_count,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id) as total_tasks,
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND status = 'completed') as completed_tasks,
-//                 DATEDIFF(p.end_date, CURDATE()) as days_remaining
-//             FROM projects p
-//             JOIN project_members pm ON p.id = pm.project_id
-//             JOIN users u ON p.created_by = u.id
-//             WHERE pm.user_id = ?
-//             ORDER BY p.created_at DESC
-//         `;
-
-//         const [projects] = await db.query(query, [userId]);
-//         res.json({ success: true, projects });
-//     } catch (error) {
-//         console.error("Fetch Projects Error: - admin.controller.js:960", error);
-//         res.status(500).json({ success: false, message: "Database Error: " + error.message });
-//     }
-// };
-
-// --- Inside admin.controller.js ---
-
-// export const getMyProjects = async (req, res) => {
-//     try {
-//         // This comes from your authentication middleware (protectAdmin)
-//         const userId = req.user.id; 
-
-//         const query = `
-//             SELECT 
-//                 p.id, 
-//                 p.name, 
-//                 p.description, 
-//                 p.status, 
-//                 p.start_date, 
-//                 p.end_date,
-//                 u.name AS creator_name,
-//                 -- 1. Counts unique team members joined in project_members
-//                 (SELECT COUNT(DISTINCT user_id) FROM project_members WHERE project_id = p.id) AS team_count,
-//                 -- 2. Counts total tasks linked to this project_id
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id) AS total_tasks,
-//                 -- 3. Counts only completed tasks for the progress bar calculation
-//                 (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND status = 'completed') AS completed_tasks,
-//                 -- 4. Calculates the "X days remaining" logic shown in your image
-//                 DATEDIFF(p.end_date, CURDATE()) AS days_remaining
-//             FROM projects p
-//             JOIN users u ON p.created_by = u.id
-//             JOIN project_members pm ON p.id = pm.project_id
-//             WHERE pm.user_id = ? 
-//             ORDER BY p.created_at DESC
-//         `;
-
-//         const [projects] = await db.query(query, [userId]);
-
-//         res.json({ 
-//             success: true, 
-//             projects 
-//         });
-
-//     } catch (err) {
-//         console.error("Fetch MyProjects Error: - admin.controller.js:1054", err.message);
-//         res.status(500).json({ 
-//             success: false, 
-//             message: "Server Database Error" 
-//         });
-//     }
-// };
-
-
+// ✅ Make sure this replaces the project creation function in ADMIN.CONTROLLER.JS
 export const createProject = async (req, res) => {
-    const connection = await db.getConnection();
+    const { name, description, status, startDate, endDate, members } = req.body;
+    const adminId = req.user.id; 
+
+    let parsedMembers = [];
+    if (members) {
+        try { parsedMembers = JSON.parse(members); } catch (e) { parsedMembers = []; }
+    }
+
     try {
-        await connection.beginTransaction();
-
-        const { name, description, start_date, end_date, members } = req.body;
-        const adminId = req.user.id; 
-
-        // 1. Insert into 'projects' table
-        // Changed 'active' to 'pending' to satisfy your new default state requirement
-        const [projectResult] = await connection.query(
-            `INSERT INTO projects (name, description, status, start_date, end_date, created_by, created_at, updated_at) 
-             VALUES (?, ?, 'pending', ?, ?, ?, NOW(), NOW())`,
-            [name, description, start_date || null, end_date || null, adminId]
+        // 1. Insert into main projects table (removed 'file' column to match your DB)
+        const [project] = await db.query(
+            'INSERT INTO projects (name, description, status, start_date, end_date, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())',
+            [name, description, status || 'active', startDate, endDate, adminId]
         );
 
-        const projectId = projectResult.insertId;
+        const projectId = project.insertId;
 
-        // 2. Prepare Member Data
-        const allMemberIds = new Set([...(members || []), adminId]);
-        
-        const memberData = Array.from(allMemberIds).map(userId => [
-            projectId,
-            userId,
-            userId === adminId ? 'admin' : 'member',
-            adminId,
-            new Date()
-        ]);
+        // 2. ✅ Save the uploaded file into the separate `project_files` table!
+        if (req.file) {
+            await db.query(
+                `INSERT INTO project_files (project_id, user_id, file_name, file_path, file_type, file_size, uploaded_at) 
+                 VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                [
+                    projectId, 
+                    adminId, 
+                    req.file.originalname, // Original name (e.g., Document.pdf)
+                    req.file.filename,     // Saved unique name (e.g., 177...pdf)
+                    req.file.mimetype,     // e.g., application/pdf
+                    req.file.size          // File size in bytes
+                ]
+            );
+        }
 
-        // 3. Insert all members
-        await connection.query(
-            "INSERT INTO project_members (project_id, user_id, role, added_by, joined_date) VALUES ?",
-            [memberData]
-        );
+        // 3. Insert team members
+        if (parsedMembers && parsedMembers.length > 0) {
+            const memberData = parsedMembers.map(userId => [
+                projectId, userId, 'member', adminId, new Date()
+            ]);
+            await db.query('INSERT INTO project_members (project_id, user_id, role, added_by, joined_date) VALUES ?', [memberData]);
+        }
 
-        // 4. Log the activity
-        await connection.query(
-            "INSERT INTO project_activities (project_id, user_id, activity_type, description, created_at) VALUES (?, ?, 'project_created', ?, NOW())",
-            [projectId, adminId, `Project '${name}' was created and initialized as PENDING.`]
-        );
-
-        await connection.commit();
-        res.status(201).json({ success: true, message: "Project created in pending state!", projectId });
-
-    } catch (error) {
-        await connection.rollback();
-        console.error("Project Creation Error: - admin.controller.js:1109", error.message);
-        res.status(500).json({ success: false, message: "Failed to create project: " + error.message });
-    } finally {
-        connection.release();
+        res.json({ success: true, message: 'Project created successfully!', projectId: projectId });
+    } catch (err) {
+        console.error("Create Project Error: - admin.controller.js:720", err);
+        res.status(500).json({ success: false, message: 'Failed to create project: ' + err.message });
     }
 };
+
 
 export const updateProjectStatus = async (req, res) => {
     try {
@@ -1135,7 +745,7 @@ export const updateProjectStatus = async (req, res) => {
 
         res.status(400).json({ success: false, message: "Project not found or no change made" });
     } catch (error) {
-        console.error("Update Status Error: - admin.controller.js:1138", error);
+        console.error("Update Status Error: - admin.controller.js:748", error);
         res.status(500).json({ success: false, message: "Database error" });
     }
 };
@@ -1164,11 +774,8 @@ export const getMyProjects = async (req, res) => {
                 DATEDIFF(p.end_date, CURDATE()) AS days_remaining
             FROM projects p
             JOIN users u ON p.created_by = u.id
-            -- We use LEFT JOIN so we don't hide projects that don't have members yet
             LEFT JOIN project_members pm ON p.id = pm.project_id
-            -- FIX: Show if I created it OR if I am a member
             WHERE p.created_by = ? OR pm.user_id = ?
-            -- GROUP BY is needed because one project might have multiple members
             GROUP BY p.id
             ORDER BY p.created_at DESC
         `;
@@ -1182,14 +789,13 @@ export const getMyProjects = async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Fetch MyProjects Error: - admin.controller.js:1185", err.message);
+        console.error("Fetch MyProjects Error: - admin.controller.js:792", err.message);
         res.status(500).json({ 
             success: false, 
             message: "Server Database Error" 
         });
     }
 };
-
 
 // 1. ADD / ASSIGN MEMBER
 export const assignMember = async (req, res) => {
@@ -1216,7 +822,7 @@ export const assignMember = async (req, res) => {
 
         res.json({ success: true, message: "Member added successfully" });
     } catch (err) {
-        console.error("Assign Error: - admin.controller.js:1219", err);
+        console.error("Assign Error: - admin.controller.js:825", err);
         res.status(500).json({ success: false, message: "Database Error" });
     }
 };
@@ -1234,7 +840,7 @@ export const removeMember = async (req, res) => {
 
         res.json({ success: true, message: "Member removed from project" });
     } catch (err) {
-        console.error("Remove Error: - admin.controller.js:1237", err);
+        console.error("Remove Error: - admin.controller.js:843", err);
         res.status(500).json({ success: false, message: "Database Error" });
     }
 };
@@ -1248,7 +854,8 @@ export const getProjectTeam = async (req, res) => {
             SELECT 
                 u.id, 
                 u.name, 
-                u.email 
+                u.email,
+                pm.role /* ✅ ADDED: Required for frontend to display role and filter users */
             FROM users u
             INNER JOIN project_members pm ON u.id = pm.user_id
             WHERE pm.project_id = ?
@@ -1256,65 +863,17 @@ export const getProjectTeam = async (req, res) => {
 
         const [team] = await db.query(query, [projectId]);
 
-        // console.log para debug: check if this prints names in your terminal
-        console.log(`Fetching team for Project ${projectId}: - admin.controller.js:1260`, team);
-
         res.json({ 
             success: true, 
             team: team 
         });
     } catch (err) {
-        console.error("Get Team Error: - admin.controller.js:1267", err);
+        console.error("Get Team Error: - admin.controller.js:871", err);
         res.status(500).json({ success: false, message: "Server Error" });
     }
 };
 
 
-// Ensure 'export' is at the start of the function
-// export const punchInController = async (req, res) => {
-//     try {
-//         const { userId, breakType } = req.body;
-//         // Your logic to insert into the database here...
-//         res.json({ success: true, message: "Punch-in successful" });
-//     } catch (error) {
-//         res.status(500).json({ success: false, message: error.message });
-//     }
-// };
-
-
-// Ensure 'export' is present and names are exact
-// export const punchInBreak = async (req, res) => {
-//     const { userId, breakType } = req.body;
-//     const now = new Date();
-//     const date = now.toISOString().split('T')[0]; 
-//     const time = now.toTimeString().split(' ')[0]; 
-
-//     try {
-//         const [result] = await db.query(
-//             "INSERT INTO breaks (user_id, break_type, break_date, break_time) VALUES (?, ?, ?, ?)",
-//             [userId, breakType, date, time]
-//         );
-//         res.json({ success: true, id: result.insertId });
-//     } catch (error) {
-//         res.status(500).json({ success: false, message: error.message });
-//     }
-// };
-
-// export const punchOutBreak = async (req, res) => {
-//     const { breakId } = req.body;
-//     const now = new Date();
-//     const endTime = now.toTimeString().split(' ')[0]; 
-
-//     try {
-//         await db.query(
-//             "UPDATE breaks SET end_time = ? WHERE id = ?",
-//             [endTime, breakId]
-//         );
-//         res.json({ success: true, message: "Punch-out recorded" });
-//     } catch (error) {
-//         res.status(500).json({ success: false, message: error.message });
-//     }
-// };
 export const punchInBreak = async (req, res) => {
     const { userId, breakType } = req.body;
     const now = new Date();
@@ -1363,5 +922,167 @@ export const punchOutBreak = async (req, res) => {
         return res.json({ success: true, message: "Punch-out recorded" });
     } catch (error) {
         return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+export const deleteUserAccount = async (req, res) => {
+    try {
+        const { id } = req.params;
+        await db.query("DELETE FROM users WHERE id = ?", [id]);
+        res.json({ success: true, message: "User deleted" });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+/// FETCH Pending Special Status Requests (WFH / OOO)
+export const getPendingStatusRequests = async (req, res) => {
+    try {
+        const [requests] = await db.query(`
+            SELECT us.*, u.name as user_name, u.email 
+            FROM user_status us
+            JOIN users u ON us.user_id = u.id
+            WHERE us.status = 'pending' 
+            AND us.status_type IN ('work_from_home', 'out_of_office', 'sick_leave')
+            ORDER BY us.created_at DESC
+        `);
+        
+        res.json({ success: true, requests });
+    } catch (err) {
+        console.error("Fetch Status Requests Error: - admin.controller.js:952", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// APPROVE or REJECT Special Status Requests
+export const handleStatusRequestAction = async (req, res) => {
+    try {
+        const { id, status } = req.body; // 'approved' or 'rejected'
+        const adminId = req.user.id; // Gets the ID of the admin making the decision
+        
+        await db.query(
+            `UPDATE user_status 
+             SET status = ?, approved_by = ?, approved_at = NOW() 
+             WHERE id = ?`, 
+            [status, adminId, id]
+        );
+        
+        res.json({ success: true, message: `Request successfully ${status}` });
+    } catch (err) {
+        console.error("Update Status Request Error: - admin.controller.js:972", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// --- SEND CUSTOM ALERT / NOTIFICATION ---
+export const sendAlert = async (req, res) => {
+    try {
+        const { message, users } = req.body;
+
+        if (!message || !users || users.length === 0) {
+            return res.status(400).json({ success: false, message: "Message and users are required." });
+        }
+
+        if (users.includes('all')) {
+            // Insert notification for ALL staff (ignoring admins)
+            await db.query(`
+                INSERT INTO notifications (user_id, title, message, type, created_at)
+                SELECT id, 'Admin Alert', ?, 'admin_alert', NOW() 
+                FROM users WHERE role != 'admin'
+            `, [message]);
+        } else {
+            // Insert notification ONLY for the selected users
+            const notificationData = users.map(userId => [
+                userId, 
+                'Admin Alert', 
+                message, 
+                'admin_alert', 
+                new Date()
+            ]);
+
+            await db.query(
+                "INSERT INTO notifications (user_id, title, message, type, created_at) VALUES ?",
+                [notificationData]
+            );
+        }
+
+        res.json({ success: true, message: "Alert dispatched successfully." });
+    } catch (err) {
+        console.error("Send Alert Error: - admin.controller.js:1011", err.message);
+        res.status(500).json({ success: false, message: "Database Error: " + err.message });
+    }
+};
+
+// FETCH PENDING TASK REASSIGNMENTS (For Admin Notification Bell)
+export const getPendingTaskReassigns = async (req, res) => {
+    try {
+        const [requests] = await db.query(`
+            SELECT id, task_id, task_name, requester_name, new_assignees_json, reason 
+            FROM reassignment_requests 
+            WHERE status = 'pending'
+        `);
+
+        for (let req of requests) {
+            req.task_title = req.task_name;
+            req.from_user = req.requester_name;
+            
+            let toUserId = null;
+            try {
+                const parsed = JSON.parse(req.new_assignees_json);
+                if (parsed && parsed.length > 0) {
+                    // ✅ FIX: If the DB accidentally stored an object like {id: 1, name: "Chandru"}, 
+                    // extract just the ID. If it's already a number, use it directly.
+                    toUserId = typeof parsed[0] === 'object' ? parsed[0].id : parsed[0];
+                }
+            } catch(e) {
+                console.error("Failed to parse JSON for request ID: - admin.controller.js:1038", req.id);
+            }
+
+            req.requested_to = toUserId;
+
+            if (toUserId) {
+                const [user] = await db.query("SELECT name FROM users WHERE id = ?", [toUserId]);
+                req.to_user = user.length > 0 ? user[0].name : 'Unknown';
+            } else {
+                req.to_user = 'Unknown';
+            }
+        }
+
+        res.json({ success: true, requests });
+    } catch (error) {
+        console.error("Fetch Pending Reassigns Error: - admin.controller.js:1053", error.message);
+        res.status(500).json({ success: false, message: "Database Error" });
+    }
+};
+
+
+
+// ADMIN ACTION: APPROVE OR REJECT
+export const handleTaskReassignAction = async (req, res) => {
+    // We will use task_id instead of id to prevent updating all '0' IDs at once
+    const { action, task_id, requested_to } = req.body; 
+    
+    try {
+        if (action === 'approved') {
+            // Wrap the new user ID in an array as a JSON string
+            const newAssigneesJson = JSON.stringify([String(requested_to)]);
+
+            // Update task assignee (REMOVED reassign_status)
+            await db.query(
+                "UPDATE tasks SET assigned_to = ? WHERE id = ?", 
+                [newAssigneesJson, task_id]
+            );
+        }
+        
+        // Update your specific table record based on task_id to avoid the '0' id bug
+        await db.query(
+            "UPDATE reassignment_requests SET status = ?, approved_at = NOW() WHERE task_id = ? AND status = 'pending'", 
+            [action, task_id]
+        );
+        
+        res.json({ success: true, message: `Task Reassignment ${action} successfully.` });
+    } catch (error) {
+        console.error("Reassign Action Error: - admin.controller.js:1085", error.message);
+        res.status(500).json({ success: false, message: "Database Error" });
     }
 };
