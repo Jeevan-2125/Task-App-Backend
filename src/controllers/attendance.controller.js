@@ -5,13 +5,13 @@ export const getAttendanceHistory = async (req, res) => {
         const userId = req.user.id;
         const { month, year } = req.query;
 
-        // ✅ FIXED: Added DATE_FORMAT for login_time to provide a clean string for the frontend
+        // ✅ FIX 1: We use DATE_FORMAT to force MySQL to output a plain string. 
+        // This stops Node.js from magically converting the timezone!
         const [rows] = await db.query(`
             SELECT 
                 DATE_FORMAT(a.date, '%Y-%m-%d') as date,
-                a.login_time as login,
-                a.login_time as raw_login_time,
-                a.logout_time,
+                DATE_FORMAT(a.login_time, '%Y-%m-%d %H:%i:%s') as login,
+                DATE_FORMAT(a.logout_time, '%Y-%m-%d %H:%i:%s') as logout_time,
                 a.status as original_status,
                 h.reason as holiday_reason,
                 CASE 
@@ -24,16 +24,14 @@ export const getAttendanceHistory = async (req, res) => {
             WHERE a.user_id = ? AND MONTH(a.date) = ? AND YEAR(a.date) = ?
         `, [userId, month, year]);
 
-        // ✅ FIXED: Mapping 'login' field so frontend record.login is never undefined
-       const history = rows.reduce((acc, row) => {
-        acc[row.date] = { 
-            // Send the raw ISO string so the frontend can convert it locally
-            login: row.login, 
-            status: row.status,
-            logout_time: row.logout_time 
-        };
-        return acc;
-    }, {});
+        const history = rows.reduce((acc, row) => {
+            acc[row.date] = { 
+                login: row.login, 
+                status: row.status,
+                logout_time: row.logout_time 
+            };
+            return acc;
+        }, {});
 
         res.json({ success: true, history });
     } catch (error) {
@@ -44,22 +42,23 @@ export const getAttendanceHistory = async (req, res) => {
 export const handleSession = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { action } = req.body; // 'refresh' or 'end'
+        const { action } = req.body; 
         const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
         const userAgent = req.headers['user-agent'];
 
         if (action === 'refresh') {
             const [existing] = await db.query(
-                "SELECT id FROM attendance WHERE user_id = ? AND date = CURDATE()", 
+                "SELECT id FROM attendance WHERE user_id = ? AND date = DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE))", 
                 [userId]
             );
 
             if (existing.length === 0) {
+                // ✅ FIX 2: Replaced NOW() with a bulletproof MySQL IST calculator (UTC + 330 mins)
                 await db.query(`
                     INSERT INTO attendance (
                         user_id, login_time, ip_address, user_agent, status, date, created_at
                     ) 
-                    VALUES (?, NOW(), ?, ?, 'Active session', CURDATE(), NOW())
+                    VALUES (?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), ?, ?, 'Active session', DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)), DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE))
                 `, [userId, ip, userAgent]);
             }
             
@@ -68,10 +67,10 @@ export const handleSession = async (req, res) => {
         else if (action === 'end') {
             await db.query(`
                 UPDATE attendance 
-                SET logout_time = NOW(), 
+                SET logout_time = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE), 
                     status = 'Present',
-                    work_hours = ROUND(TIMESTAMPDIFF(MINUTE, login_time, NOW()) / 60, 2)
-                WHERE user_id = ? AND date = CURDATE() AND logout_time IS NULL
+                    work_hours = ROUND(TIMESTAMPDIFF(MINUTE, login_time, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) / 60, 2)
+                WHERE user_id = ? AND date = DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) AND logout_time IS NULL
             `, [userId]);
 
             await db.query("UPDATE users SET status = 'inactive' WHERE id = ?", [userId]);
@@ -79,7 +78,7 @@ export const handleSession = async (req, res) => {
 
         res.json({ success: true });
     } catch (error) {
-        console.error("HandleSession Error: - attendance.controller.js:82", error);
+        console.error("HandleSession Error: - attendance.controller.js:81", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -88,7 +87,7 @@ export const checkCurrentSession = async (req, res) => {
     try {
         const userId = req.user.id; 
         const [session] = await db.query(
-          "SELECT id FROM attendance WHERE user_id = ? AND date = CURDATE() AND logout_time IS NULL",
+          "SELECT id FROM attendance WHERE user_id = ? AND date = DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) AND logout_time IS NULL",
             [userId]
         );
 
@@ -107,7 +106,7 @@ export const getAdminAttendanceDashboard = async (req, res) => {
             SELECT 
                 COUNT(CASE WHEN status = 'Present' THEN 1 END) as presentCount,
                 COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absentCount
-            FROM attendance WHERE date = CURDATE()
+            FROM attendance WHERE date = DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE))
         `);
         
         res.json({ success: true, stats: stats[0] });
@@ -118,18 +117,12 @@ export const getAdminAttendanceDashboard = async (req, res) => {
 
 export const toggleHoliday = async (req, res) => {
     const { date, reason, type } = req.body; 
-
     try {
-        // 1. Check if the holiday already exists on this date
         const [existing] = await db.query("SELECT id FROM holidays WHERE holiday_date = ?", [date]);
-
         if (existing.length > 0) {
-            // 2. If it exists, delete it (Toggle Off)
             await db.query("DELETE FROM holidays WHERE holiday_date = ?", [date]);
             return res.json({ success: true, message: "Holiday removed successfully" });
         } else {
-            // 3. If not, insert it (Toggle On) 
-            // Matches your columns: holiday_date, reason, type
             await db.query(
                 "INSERT INTO holidays (holiday_date, reason, type) VALUES (?, ?, ?)",
                 [date, reason, type || 'Government']
@@ -137,11 +130,9 @@ export const toggleHoliday = async (req, res) => {
             return res.json({ success: true, message: "Holiday set successfully" });
         }
     } catch (error) {
-        console.error("Database Error: - attendance.controller.js:140", error);
         res.status(500).json({ success: false, message: "Database error: " + error.message });
     }
 };
-
 
 export const getHolidays = async (req, res) => {
     try {
