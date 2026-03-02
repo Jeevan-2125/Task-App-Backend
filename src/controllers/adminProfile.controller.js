@@ -29,11 +29,6 @@ export const updateAdminStatus = async (req, res) => {
 };
 
 
-/**
- * Fetches all necessary data for the Admin Profile tabs
- * Mapped to 'projects', 'tasks', and 'attendance' tables
- */
-
 export const getAdminProfileTabs = async (req, res) => {
     try {
         const adminId = req.user.id; // From verifyToken middleware
@@ -81,7 +76,7 @@ export const getAdminProfileTabs = async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Profile Backend Error: - adminProfile.controller.js:84", err.message);
+        console.error("Profile Backend Error: - adminProfile.controller.js:79", err.message);
         res.status(500).json({ success: false, message: "Server Error: Database connection failed." });
     }
 };
