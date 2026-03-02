@@ -3,45 +3,43 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// 1. Named Export
 export const sendOTPEmail = async (userEmail, otp) => {
-  const url = 'https://api.brevo.com/v3/smtp/email';
-  
-  const payload = {
-    // IMPORTANT: Make sure this email matches your Brevo account email
-    sender: { name: "Task App Support", email: process.env.BREVO_SMTP_USER },
-    to: [{ email: userEmail }],
-    subject: "Your Password Reset OTP Code",
-    htmlContent: `<p>Your OTP is <b>${otp}</b>. It is valid for 10 minutes.</p>`
+  // Move transporter inside the function to ensure process.env is ready
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // true for 465, false for other ports
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+    // Optional: This can help bypass some strict network proxy issues
+    tls: {
+      rejectUnauthorized: false 
+    }
+  });
+
+  const mailOptions = {
+    from: `"Task App Support" <${process.env.EMAIL_USER}>`,
+    to: userEmail,
+    subject: 'Your OTP Code',
+    text: `Your OTP is ${otp}`,
   };
-  console.log(process.env.BREVO_SMTP_USER,process.env.BREVO_API_KEY)
+
+
 
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'api-key': process.env.BREVO_API_KEY, // Use the new REST API key here
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error("Brevo API Error Details:", errorData);
-      throw new Error(`Brevo HTTP API failed with status: ${response.status}`);
-    }
-
-    console.log("Email sent successfully bypassing Render's firewall!");
+    // Add this temporary line to see what keys exist
+    console.log("All Env Keys: - otp.service.js:34", Object.keys(process.env).filter(k => k.includes('EMAIL')));
+    
+    await transporter.sendMail(mailOptions);
     return { success: true };
   } catch (error) {
-    console.error("OTP Send Error:", error.message);
+    console.error("Debug Credentials > User: - otp.service.js:39", process.env.EMAIL_USER ? "Present" : "Missing", "| Pass:", process.env.EMAIL_PASS ? "Present" : "Missing");
     throw error;
   }
 };
 
+// 2. Default Export
 export default sendOTPEmail;
-
-
-
-
